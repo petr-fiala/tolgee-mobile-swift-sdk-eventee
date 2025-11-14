@@ -34,7 +34,7 @@ public final class Tolgee {
     public static let shared = Tolgee(
         urlSession: URLSession(configuration: .default),
         cache: FileCache(),
-        appVersionSignature: getAppVersionSignature())
+        appVersionSignature: nil) // set to nil, we don't want "discard" cached translation for every new app version
 
     // table - [key - TranslationEntry]
     private var translations: [String: [String: TranslationEntry]] = [:]
@@ -54,13 +54,6 @@ public final class Tolgee {
     /// This property becomes `true` after the first successful call to `initialize(cdn:language:namespaces:)`.
     /// Subsequent initialization attempts will be ignored while this remains `true`.
     private(set) public var isInitialized = false
-
-    /// The timestamp of the last successful translation fetch from the CDN.
-    ///
-    /// This property is `nil` until the first successful CDN fetch completes. It's updated
-    /// each time translations are successfully retrieved from the remote CDN, regardless
-    /// of whether the translations actually changed.
-    private(set) public var lastFetchDate: Date?
 
     private var appVersionSignature: String? = nil
 
@@ -163,11 +156,7 @@ public final class Tolgee {
         cdnURL = cdn
         self.namespaces = namespaces
 
-        // Track whether we found any cached data for this app version
-        var foundAnyCache = false
-
         if let etag = cache.loadCdnEtag(for: .init(language: language, cdn: cdn.absoluteString)) {
-            foundAnyCache = true
             cdnEtags[""] = etag
             logger.debug(
                 "Loaded CDN ETag for language: \(language) and base namespace - ETag: \(etag)")
@@ -180,7 +169,6 @@ public final class Tolgee {
                 language: language, appVersionSignature: appVersionSignature,
                 cdn: cdn.absoluteString))
         {
-            foundAnyCache = true
             do {
                 // Load cached translations
                 let translations = try JSONParser.loadTranslations(from: data)
@@ -196,11 +184,9 @@ public final class Tolgee {
         }
 
         for namespace in namespaces {
-
             if let etag = cache.loadCdnEtag(
                 for: .init(language: language, namespace: namespace, cdn: cdn.absoluteString))
             {
-                foundAnyCache = true
                 cdnEtags[namespace] = etag
                 logger.debug(
                     "Loaded CDN ETag for language: \(language), namespace: \(namespace) - ETag: \(etag)"
@@ -214,7 +200,6 @@ public final class Tolgee {
                     language: language, namespace: namespace,
                     appVersionSignature: appVersionSignature, cdn: cdn.absoluteString))
             {
-                foundAnyCache = true
                 do {
                     // Load cached translations for each namespace
                     let translations = try JSONParser.loadTranslations(from: data)
@@ -230,17 +215,6 @@ public final class Tolgee {
                 logger.debug(
                     "No cached translations found for language: \(language), namespace: \(namespace)"
                 )
-            }
-        }
-
-        // If no cache was found for the current app version, clear all cache
-        // This ensures we wipe cache files from old app versions
-        if !foundAnyCache {
-            do {
-                try clearCaches()
-                logger.debug("Cleared all cache since no cache found for current app version")
-            } catch {
-                logger.error("Failed to clear cache: \(error)")
             }
         }
 
@@ -261,10 +235,7 @@ public final class Tolgee {
             return
         }
 
-        logger.debug(
-            String(
-                "Fetching translations from CDN for language: \(language), namespaces: \(namespaces)"
-            ))
+        logger.debug(String("Fetching translations from CDN for language: \(language), namespaces: \(namespaces)"))
 
         // Construct file paths for all translation files
         var files: [FetchCdnService.CdnFile] = [
@@ -284,8 +255,7 @@ public final class Tolgee {
 
                 let data = result.0
                 guard let response = result.1 as? HTTPURLResponse else {
-                    logger.error(
-                        "Invalid response for file path: \(filePath). It's not an HTTP response.")
+                    logger.error("Invalid response for file path: \(filePath). It's not an HTTP response.")
                     continue
                 }
 
@@ -307,13 +277,11 @@ public final class Tolgee {
                     {
                         // I don't feel comfortable disabling the default caching and redirect handling of URLSession
                         // so let's just compare the returned Etag with the last known one and return early if they match.
-                        logger.debug(
-                            "No changes for table '\(table)' based on ETag, skipping update")
+                        logger.debug("No changes for table '\(table)' based on ETag, skipping update")
                         continue
                     } else if response.statusCode >= 400 {
-                        logger.error(
-                            "Failed to fetch translations for table '\(table)': HTTP \(response.statusCode)"
-                        )
+                        logger.error("Failed to fetch translations for table '\(table)': HTTP \(response.statusCode)")
+                        print("[Tolgee] Failed to fetch translations for '\(language)': HTTP \(response.statusCode)")
                         continue
                     }
 
@@ -359,27 +327,165 @@ public final class Tolgee {
                         try self.cache.saveCdnEtag(etagDescriptor, etag: etag)
                         self.cdnEtags[table] = etag
                     } else {
-                        self.logger.info(
-                            "No etag header found for \(cdnURL.appending(component: filePath))")
+                        self.logger.info("No etag header found for \(cdnURL.appending(component: filePath))")
                     }
 
-                    logger.debug(
-                        "Cached translations for language: \(language), namespace: \(table.isEmpty ? "base" : table)"
-                    )
+                    logger.debug("Cached translations for language: \(language), namespace: \(table.isEmpty ? "base" : table)")
                 } catch {
                     logger.error("Error loading translations for table '\(table)': \(error)")
                 }
             }
 
-            lastFetchDate = Date()
             onTranslationsUpdatedSubscribers.forEach {
                 $0.yield(())
             }
-            logger.debug(
-                "Translations fetched successfully at \(self.lastFetchDate ?? .distantPast)")
+            logger.debug("remoteFetch() finished")
         } catch {
             logger.error("Failed to fetch remote translations: \(error)")
         }
+    }
+
+    /// Downloads and caches a language, does not change current translations
+    public func preCacheLanguage(language: String) async {
+        guard isInitialized, let cdnURL else {
+            logger.error("PreCache: Tolgee must be initialized before pre-caching a language")
+            return
+        }
+        
+        logger.debug("PreCache: Pre-caching language: \(language)")
+
+        // Construct file paths for all translation files
+        var files: [FetchCdnService.CdnFile] = [
+            .init(path: "\(language).json", etag: cdnEtags[""])
+        ]  // Base language file
+        for namespace in namespaces {
+            files.append(.init(path: "\(namespace)/\(language).json", etag: cdnEtags[namespace]))  // Namespace files
+        }
+
+        do {
+            let translationData = try await fetchCdnService.fetchFiles(
+                from: cdnURL,
+                files: files)
+
+            // Process the fetched translation data
+            for (filePath, result) in translationData {
+
+                let data = result.0
+                guard let response = result.1 as? HTTPURLResponse else {
+                    logger.error("PreCache: Invalid response for file path: \(filePath). It's not an HTTP response.")
+                    continue
+                }
+
+                // Determine the table name from the file path
+                let table: String
+                if filePath == "\(language).json" {
+                    table = ""  // Base table
+                } else {
+                    // Extract table name from "table/language.json" format
+                    table = String(filePath.prefix(while: { $0 != "/" }))
+                }
+
+                let returnedEtag = response.allHeaderFields["Etag"] as? String
+
+                do {
+                    if let returnedEtag, returnedEtag.isEmpty == false,
+                       returnedEtag == cdnEtags[table]
+                    {
+                        // I don't feel comfortable disabling the default caching and redirect handling of URLSession
+                        // so let's just compare the returned Etag with the last known one and return early if they match.
+                        logger.debug("PreCache: No changes for table '\(table)' based on ETag, skipping update")
+                        continue
+                    } else if response.statusCode >= 400 {
+                        logger.error("PreCache: Failed to fetch translations for table '\(table)': HTTP \(response.statusCode)")
+                        print("[Tolgee] PreCache: Failed to fetch translations for '\(language)': HTTP \(response.statusCode)")
+                        continue
+                    }
+
+                    // Cache the fetched data
+                    let descriptor: CacheDescriptor
+                    if table.isEmpty {
+                        descriptor = CacheDescriptor(
+                            language: language, appVersionSignature: self.appVersionSignature,
+                            cdn: cdnURL.absoluteString)
+                    } else {
+                        descriptor = CacheDescriptor(
+                            language: language, namespace: table,
+                            appVersionSignature: self.appVersionSignature,
+                            cdn: cdnURL.absoluteString)
+                    }
+
+                    do {
+                        try self.cache.saveRecords(data, for: descriptor)
+                    } catch {
+                        self.logger.error("PreCache: Failed to save translations to cache: \(error)")
+                    }
+
+                    if let etag = response.allHeaderFields["Etag"] as? String {
+                        let etagDescriptor: CdnEtagDescriptor
+                        if table.isEmpty {
+                            etagDescriptor = CdnEtagDescriptor(
+                                language: language,
+                                cdn: cdnURL.absoluteString)
+                        } else {
+                            etagDescriptor = CdnEtagDescriptor(
+                                language: language, namespace: table,
+                                cdn: cdnURL.absoluteString)
+                        }
+                        try self.cache.saveCdnEtag(etagDescriptor, etag: etag)
+                        self.cdnEtags[table] = etag
+                    } else {
+                        self.logger.info("PreCache: No etag header found for \(cdnURL.appending(component: filePath))")
+                    }
+
+                    logger.debug("PreCache: Cached translations for language: \(language), namespace: \(table.isEmpty ? "base" : table)")
+                } catch {
+                    logger.error("PreCache: Error loading translations for table '\(table)': \(error)")
+                }
+            }
+        } catch {
+            logger.error("PreCache: Failed to fetch remote translations: \(error)")
+        }
+    }
+
+    /// Allows changing language at runtime without restarting the app
+    public func changeLanguage(to newLanguage: String) {
+        guard isInitialized, let cdnURL = self.cdnURL else {
+            logger.error("Tolgee must be initialized before changing language")
+            return
+        }
+
+        logger.debug("Changing language from \(self.language ?? "nil") to \(newLanguage)")
+
+        language = newLanguage
+
+        if let etag = cache.loadCdnEtag(for: .init(language: newLanguage, cdn: cdnURL.absoluteString)) {
+            cdnEtags[""] = etag
+            logger.debug(
+                "Loaded CDN ETag for language: \(newLanguage) and base namespace - ETag: \(etag)")
+        } else {
+            logger.debug("No CDN ETag found for language: \(newLanguage) and base namespace")
+        }
+
+        if let data = cache.loadRecords(
+            for: CacheDescriptor(
+                language: newLanguage, appVersionSignature: appVersionSignature,
+                cdn: cdnURL.absoluteString))
+        {
+            do {
+                // Load cached translations
+                let translations = try JSONParser.loadTranslations(from: data)
+                self.translations[""] = translations
+                logger.debug(
+                    "Loaded cached translations for language: \(newLanguage) and base namespace"
+                )
+            } catch {
+                logger.error("Failed to load cached translations: \(error)")
+            }
+        } else {
+            logger.debug("No cached translations found for language: \(newLanguage)")
+        }
+
+        logger.debug("Language changed successfully to \(newLanguage)")
     }
 
     /// Translates a given key to a localized string with optional format arguments.
@@ -410,19 +516,18 @@ public final class Tolgee {
     /// let buttonText = tolgee.translate("save_button", table: "Buttons")
     /// ```
     public func translate(
-        _ key: String, _ arguments: CVarArg..., table: String? = nil, bundle: Bundle = .main
+        _ key: String, _ arguments: [CVarArg] = [], table: String? = nil, bundle: Bundle = .main
     )
         -> String
     {
-        let locale = Locale.current
+        // Use locale matching the initialized language (important for correct use of plural variants), fallback to current locale
+        let locale = language.map { Locale(identifier: $0) } ?? Locale.current
 
         // First try to get translation from loaded translations
-        if let translationEntry = translations[table ?? ""]?[key],
-            language == locale.language.languageCode?.identifier
+        if let translationEntry = translations[table ?? ""]?[key]
         {
             switch translationEntry {
             case .simple(let string):
-                // If we have arguments, try to format the string
                 if !arguments.isEmpty {
                     return String(format: string, locale: locale, arguments: arguments)
                 }
@@ -430,32 +535,15 @@ public final class Tolgee {
             case .plural(let variants):
                 let pluralRules = PluralRules(for: locale)
                 if let number = arguments.compactMap({ $0 as? NSNumber }).first {
-                    switch pluralRules.category(for: number.doubleValue) {
-                    case .zero:
-                        if let string = variants.zero {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
-                    case .one:
-                        if let string = variants.one {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
-                    case .two:
-                        if let string = variants.two {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
-                    case .few:
-                        if let string = variants.few {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
-                    case .many:
-                        if let string = variants.many {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
-                    case .other:
-                        if let string = variants.other {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
+                    let selectedVariant = selectPluralVariant(
+                        variants: variants,
+                        number: number.doubleValue,
+                        pluralRules: pluralRules
+                    )
+                    if !arguments.isEmpty {
+                        return String(format: selectedVariant, locale: locale, arguments: arguments)
                     }
+                    return selectedVariant
                 }
             }
         }
@@ -470,6 +558,26 @@ public final class Tolgee {
         }
 
         return localizedString
+    }
+
+    /// Helper method to select the appropriate plural variant based on plural rules
+    private func selectPluralVariant(variants: PluralVariants, number: Double, pluralRules: PluralRules) -> String {
+        switch pluralRules.category(for: number) {
+        case .zero:
+            if let string = variants.zero { return string }
+        case .one:
+            if let string = variants.one { return string }
+        case .two:
+            if let string = variants.two { return string }
+        case .few:
+            if let string = variants.few { return string }
+        case .many:
+            if let string = variants.many { return string }
+        case .other:
+            break
+        }
+        // Always fallback to 'other' if specific category not found
+        return variants.other ?? ""
     }
 
     /// Translates a given key to a localized string with optional format arguments and custom locale.
@@ -507,18 +615,16 @@ public final class Tolgee {
     @available(iOS 18.4, *)
     @available(macOS 15.4, *)
     public func translate(
-        _ key: String, _ arguments: CVarArg..., table: String? = nil, bundle: Bundle = .main,
+        _ key: String, _ arguments: [CVarArg] = [], table: String? = nil, bundle: Bundle = .main,
         locale: Locale = .current
     )
         -> String
     {
         // First try to get translation from loaded translations
-        if let translationEntry = translations[table ?? ""]?[key],
-            language == locale.language.languageCode?.identifier
+        if let translationEntry = translations[table ?? ""]?[key]
         {
             switch translationEntry {
             case .simple(let string):
-                // If we have arguments, try to format the string
                 if !arguments.isEmpty {
                     return String(format: string, locale: locale, arguments: arguments)
                 }
@@ -526,32 +632,15 @@ public final class Tolgee {
             case .plural(let variants):
                 let pluralRules = PluralRules(for: locale)
                 if let number = arguments.compactMap({ $0 as? NSNumber }).first {
-                    switch pluralRules.category(for: number.doubleValue) {
-                    case .zero:
-                        if let string = variants.zero {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
-                    case .one:
-                        if let string = variants.one {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
-                    case .two:
-                        if let string = variants.two {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
-                    case .few:
-                        if let string = variants.few {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
-                    case .many:
-                        if let string = variants.many {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
-                    case .other:
-                        if let string = variants.other {
-                            return String(format: string, locale: locale, arguments: arguments)
-                        }
+                    let selectedVariant = selectPluralVariant(
+                        variants: variants,
+                        number: number.doubleValue,
+                        pluralRules: pluralRules
+                    )
+                    if !arguments.isEmpty {
+                        return String(format: selectedVariant, locale: locale, arguments: arguments)
                     }
+                    return selectedVariant
                 }
             }
         }
